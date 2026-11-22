@@ -38,7 +38,6 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1 import nixl
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
-    KVConnectorTransferResults,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
@@ -753,11 +752,97 @@ class TestNixlHandshake:
         if not expected_tracked:
             assert connector.get_finished(set()) == (set(), set())
 
-        worker.get_transfer_results = MagicMock(
-            return_value=KVConnectorTransferResults(finished_sending={"sent"})
-        )
+        # The worker-side hook reports the same thing: a replicated-KV rank > 0
+        # must not hide what it reported as sent, or the scheduler-side
+        # aggregation over all workers never completes and the request's
+        # blocks are never freed.
+        metadata = NixlConnectorMetadata()
+        metadata.reqs_in_batch.add("req2")
+        metadata.reqs_to_send["req2"] = time.perf_counter() + 10
+        worker.start_load_kv(metadata)
+        worker._pop_done_transfers = MagicMock(return_value=(set(), set()))
         results = connector.get_transfer_results(set())
-        assert results.finished_sending == ({"sent"} if expected_tracked else set())
+        assert results.finished_sending == ({"sent"} if expected_tracked else {"req2"})
+
+    @pytest.mark.parametrize("pcp_size", [2, 8])
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
+    def test_replicated_pcp_producer_frees_request_when_rank0_is_done(
+        self, default_vllm_config, dist_init, pcp_size
+    ):
+        """A replicated-KV PCP producer finishes sending a request exactly when
+        PCP rank 0 does: not before, and not never."""
+        from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+
+        block_size = maybe_update_block_size(16)
+        vllm_config = create_vllm_config(kv_role="kv_producer", block_size=block_size)
+        vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
+
+        connectors = []
+        for pcp_rank in range(pcp_size):
+            with (
+                patch(
+                    "vllm.distributed.kv_transfer.kv_connector.v1.nixl."
+                    "base_worker.get_current_attn_backends",
+                    return_value=[FlashAttentionBackend],
+                ),
+                patch(
+                    "vllm.distributed.kv_transfer.kv_connector.v1.nixl."
+                    "base_worker.get_pcp_group"
+                ) as mock_get_pcp_group,
+            ):
+                mock_get_pcp_group.return_value.rank_in_group = pcp_rank
+                connector = NixlConnector(
+                    vllm_config,
+                    KVConnectorRole.WORKER,
+                    make_kv_cache_config(block_size=block_size),
+                )
+            worker = connector.connector_worker
+            assert worker is not None
+            worker.transfer_topo = MagicMock()
+            worker._get_new_notifs = MagicMock(side_effect=set)
+            worker._pop_done_transfers = MagicMock(return_value=(set(), set()))
+            connectors.append(connector)
+
+        # TP 1 x PCP `pcp_size` workers, as the executor builds it.
+        aggregator = KVOutputAggregator.from_connector(connectors[0], pcp_size)
+
+        def step() -> set[str]:
+            outputs = []
+            for connector in connectors:
+                results = connector.get_transfer_results(set())
+                outputs.append(
+                    ModelRunnerOutput(
+                        req_ids=[],
+                        kv_connector_output=KVConnectorOutput(
+                            finished_sending=results.finished_sending or None
+                        ),
+                    )
+                )
+            aggregated = aggregator.aggregate(outputs)
+            assert aggregated is not None
+            kv_output = aggregated.kv_connector_output
+            assert kv_output is not None
+            return kv_output.finished_sending or set()
+
+        metadata = NixlConnectorMetadata()
+        metadata.reqs_in_batch.add("req")
+        metadata.reqs_to_send["req"] = time.perf_counter() + 10
+        for connector in connectors:
+            assert connector.connector_worker is not None
+            connector.connector_worker.start_load_kv(metadata)
+
+        # Ranks > 0 report at once; rank 0 is still serving the KV.
+        assert step() == set()
+
+        # The consumer has read the blocks from rank 0.
+        rank0 = connectors[0].connector_worker
+        assert rank0 is not None
+        rank0._get_new_notifs = MagicMock(side_effect=[{"req"}, set()])
+        assert step() == {"req"}
+        assert step() == set()
 
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
